@@ -72,6 +72,10 @@ impl ShaderManager {
                 bass: f32,
                 mid: f32,
                 treble: f32,
+                // Pad to 16-byte alignment
+                _padding1: f32,
+                _padding2: f32,
+                _padding3: f32,
             };
             
             @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -99,6 +103,10 @@ impl ShaderManager {
                 waveform_data: array<f32, 1024>,
                 time: f32,
                 volume: f32,
+                // Pad to 16-byte alignment
+                _padding1: f32,
+                _padding2: f32,
+                _padding3: f32,
             };
             
             @group(0) @binding(0) var<uniform> uniforms: Uniforms;

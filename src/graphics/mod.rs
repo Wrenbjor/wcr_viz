@@ -10,6 +10,8 @@ use winit::{
 };
 
 use crate::audio::{AudioEvent, AudioData};
+use crate::preset::PresetManager;
+use crate::ui::PresetUI;
 
 pub mod renderer;
 pub mod shaders;
@@ -61,6 +63,8 @@ struct AppState {
     current_audio_data: Option<AudioData>,
     config: GraphicsConfig,
     is_running: bool,
+    preset_manager: PresetManager,
+    preset_ui: PresetUI,
 }
 
 impl ApplicationHandler for AppState {
@@ -99,14 +103,48 @@ impl ApplicationHandler for AppState {
                 }
                 WindowEvent::KeyboardInput {
                     event: winit::event::KeyEvent {
-                        physical_key: PhysicalKey::Code(KeyCode::Escape),
+                        physical_key: PhysicalKey::Code(key_code),
                         state: ElementState::Pressed,
                         ..
                     },
                     ..
                 } => {
-                    info!("ESC pressed, exiting");
-                    event_loop.exit();
+                    // Convert key codes to the format expected by the UI handler
+                    let key_str = match key_code {
+                        KeyCode::Tab => "Tab",
+                        KeyCode::Space => "Space",
+                        KeyCode::Period => "Period",
+                        KeyCode::Comma => "Comma",
+                        KeyCode::Enter => "Enter",
+                        KeyCode::Escape => "Escape",
+                        KeyCode::ArrowUp => "Up",
+                        KeyCode::ArrowDown => "Down",
+                        KeyCode::ArrowLeft => "Left",
+                        KeyCode::ArrowRight => "Right",
+                        _ => {
+                            // For other keys, use the debug format
+                            let key_str = format!("{:?}", key_code);
+                            log::info!("Graphics: Key pressed: {}", key_str);
+                            // Handle non-UI keys
+                            match key_code {
+                                KeyCode::Escape => {
+                                    info!("ESC pressed, exiting");
+                                    event_loop.exit();
+                                }
+                                _ => {}
+                            }
+                            return;
+                        }
+                    };
+                    
+                    log::info!("Graphics: Key pressed: {}", key_str);
+                    if self.preset_ui.handle_key(&mut self.preset_manager, key_str) {
+                        log::info!("Graphics: UI handled key, requesting redraw");
+                        // UI handled the key, request redraw for UI update
+                        if let Some(ref window_manager) = &self.window_manager {
+                            window_manager.window.request_redraw();
+                        }
+                    }
                 }
                 WindowEvent::Resized(physical_size) => {
                     info!("Window resized to {}x{}", physical_size.width, physical_size.height);
@@ -148,6 +186,15 @@ impl ApplicationHandler for AppState {
                                 if let Err(e) = renderer.render(&view) {
                                     error!("Render error: {}", e);
                                 }
+                                
+                                // Render UI overlay
+                                if self.preset_ui.is_overlay_visible() {
+                                    log::info!("Graphics: Rendering UI overlay");
+                                    if let Err(e) = self.preset_ui.render_overlay(renderer) {
+                                        error!("UI render error: {}", e);
+                                    }
+                                }
+                                
                                 output.present();
                             }
                         }
@@ -186,7 +233,10 @@ impl AppState {
         let device = window_manager.device().clone();
         let queue = window_manager.queue().clone();
         let config = window_manager.config();
-        let renderer = Renderer::new(device, queue, config)?;
+        let mut renderer = Renderer::new(device, queue, config)?;
+        
+        // Set the preset manager in the renderer
+        renderer.set_preset_manager(self.preset_manager.clone());
         
         Ok((window_manager, renderer))
     }
@@ -196,6 +246,8 @@ impl AppState {
 pub struct GraphicsSystem {
     config: GraphicsConfig,
     audio_receiver: Receiver<AudioEvent>,
+    preset_manager: PresetManager,
+    preset_ui: PresetUI,
 }
 
 impl GraphicsSystem {
@@ -203,12 +255,16 @@ impl GraphicsSystem {
     pub async fn new(
         config: GraphicsConfig,
         audio_receiver: Receiver<AudioEvent>,
+        preset_manager: PresetManager,
+        preset_ui: PresetUI,
     ) -> Result<Self> {
         info!("Initializing graphics system");
         
         Ok(Self {
             config,
             audio_receiver,
+            preset_manager,
+            preset_ui,
         })
     }
     
@@ -227,6 +283,8 @@ impl GraphicsSystem {
             current_audio_data: None,
             config: self.config.clone(),
             is_running: true,
+            preset_manager: self.preset_manager.clone(),
+            preset_ui: self.preset_ui.clone(),
         };
         
         // Run the event loop with the new ApplicationHandler pattern

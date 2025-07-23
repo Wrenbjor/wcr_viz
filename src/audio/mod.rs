@@ -200,11 +200,14 @@ impl AudioSystem {
                     // Send processed data to listeners
                     if let Err(e) = event_sender.send(AudioEvent::DataReady(audio_data)) {
                         log::warn!("Failed to send audio data: {}", e);
+                        // If the channel is disconnected, exit the loop gracefully
+                        break;
                     }
                 }
                 Err(e) => {
                     if *is_running.read() {
                         log::error!("Audio frame receive error: {}", e);
+                        // Try to send error event, but don't fail if channel is disconnected
                         let _ = event_sender.send(AudioEvent::Error(format!("Receive error: {}", e)));
                     }
                     break;

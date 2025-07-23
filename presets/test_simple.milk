@@ -1,0 +1,23 @@
+[preset00]
+name="Simple Test Preset"
+author="Wren AI"
+rating=4
+description="A simple test preset for parser verification"
+tags=test,simple,colorful
+
+per_frame_1=q1=q1+0.1
+per_frame_2=q2=sin(time)*0.5
+per_frame_3=q3=cos(time)*0.3
+per_frame_4=q4=bass*2.0
+
+[per_pixel]
+ret=ret*0.95
+ret=ret+sin(q1)*0.1
+ret=ret+cos(q2)*0.1
+
+[warp]
+dx=sin(time*0.5)*0.1
+dy=cos(time*0.3)*0.1
+
+[comp]
+ret=ret*1.2 

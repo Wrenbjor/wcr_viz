@@ -1,15 +1,20 @@
 use anyhow::Result;
 use clap::Parser;
-use log::{info, error};
+use log::{info, error, warn};
 use std::sync::Arc;
+use tokio::time;
 
 mod audio;
 mod config;
 mod graphics;
+mod preset;
+mod ui;
 
 use audio::AudioSystem;
 use config::Config;
 use graphics::{GraphicsSystem, GraphicsConfig};
+use preset::PresetManager;
+use ui::PresetUI;
 
 #[derive(Parser)]
 #[command(name = "wcr-viz")]
@@ -68,8 +73,22 @@ async fn main() -> Result<()> {
     // Get audio event receiver
     let audio_receiver = audio_system.event_receiver();
     
+    // Initialize preset system
+    let preset_manager = PresetManager::new();
+    let mut preset_ui = PresetUI::new();
+    info!("Preset system initialized");
+    
+    // Load presets from Cream of the Crop collection
+    info!("Attempting to load presets from: presets/cream-of-the-crop");
+    if let Err(e) = preset_ui.load_presets("presets/cream-of-the-crop") {
+        warn!("Failed to load presets: {}", e);
+    } else {
+        info!("Loaded presets from Cream of the Crop collection");
+        info!("Available categories: {:?}", preset_ui.get_categories());
+    }
+    
     // Start audio system
-    let audio_handle = {
+    let mut audio_handle = {
         let audio_system = Arc::clone(&audio_system);
         tokio::spawn(async move {
             if let Err(e) = audio_system.start().await {
@@ -89,15 +108,32 @@ async fn main() -> Result<()> {
     };
     
     // Initialize graphics system
-    let mut graphics_system = GraphicsSystem::new(graphics_config, audio_receiver).await?;
-    info!("Graphics system initialized");
+    info!("Initializing graphics system with UI integration...");
+    let mut graphics_system = GraphicsSystem::new(graphics_config, audio_receiver, preset_manager, preset_ui).await?;
+    info!("Graphics system initialized with UI support");
     
     // Run graphics system (this will block until window is closed)
     info!("Starting visualization...");
     graphics_system.run().await?;
     
-    // Cleanup
-    audio_handle.abort();
+    // Cleanup - stop audio system gracefully first
+    info!("Shutting down audio system...");
+    if let Err(e) = audio_system.stop().await {
+        error!("Error stopping audio system: {}", e);
+    }
+    
+    // Wait a moment for audio system to fully stop, with timeout
+    let timeout = time::sleep(time::Duration::from_millis(500));
+    
+    tokio::select! {
+        _ = timeout => {
+            info!("Audio shutdown timeout reached, forcing abort");
+            audio_handle.abort();
+        }
+        _ = &mut audio_handle => {
+            info!("Audio task completed gracefully");
+        }
+    }
     info!("RustDrop shutdown complete");
     
     Ok(())
