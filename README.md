@@ -1,4 +1,4 @@
-# RustDrop - Modern MilkDrop Music Visualizer
+# WCR_Viz - Modern MilkDrop Music Visualizer
 
 A high-performance music visualizer written in Rust, inspired by the classic MilkDrop plugin for Winamp.
 
@@ -39,8 +39,8 @@ We're currently in **Phase 1** of development, focusing on:
 
 ```bash
 # Create your project directory
-mkdir rustdrop
-cd rustdrop
+mkdir WCR_Viz
+cd WCR_Viz
 
 # Copy the provided Cargo.toml and source files
 # (Use the artifacts provided in this conversation)
@@ -50,7 +50,7 @@ cd rustdrop
 
 Create this directory structure:
 ```
-rustdrop/
+WCR_Viz/
 ├── Cargo.toml
 ├── src/
 │   ├── main.rs
@@ -122,11 +122,11 @@ show_audio_levels = true
 
 When running with `--verbose`, you should see:
 ```
-INFO  rustdrop] Starting RustDrop Music Visualizer v0.1.0
-INFO  rustdrop::audio::capture] Using audio host: Wasapi
-INFO  rustdrop::audio::capture] Using default output device for loopback: Speakers
-INFO  rustdrop] Audio capture system initialized
-INFO  rustdrop] RustDrop is running. Press Ctrl+C to exit.
+INFO  WCR_Viz] Starting WCR_Viz Music Visualizer v0.1.0
+INFO  WCR_Viz::audio::capture] Using audio host: Wasapi
+INFO  WCR_Viz::audio::capture] Using default output device for loopback: Speakers
+INFO  WCR_Viz] Audio capture system initialized
+INFO  WCR_Viz] WCR_Viz is running. Press Ctrl+C to exit.
 ```
 
 And periodic audio analysis data in the logs.
@@ -203,7 +203,7 @@ AudioAnalyzer → FFT → FrequencyData + AudioFeatures → Console Display
 ## 🔬 Testing Your Audio Setup
 
 1. **Play music** in any application (Spotify, YouTube, etc.)
-2. **Run RustDrop** with `cargo run -- --verbose`
+2. **Run WCR_Viz** with `cargo run -- --verbose`
 3. **Check logs** for audio level and beat detection
 4. **Verify** that volume/bass/treble values change with music
 
