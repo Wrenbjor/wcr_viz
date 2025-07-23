@@ -1,0 +1,24 @@
+[audio]
+sample_rate = 48000
+buffer_size = 512
+fft_size = 2048
+capture_mode = "Input"
+enable_loopback = false
+device_name = "Headset Microphone (Realtek(R) Audio)"
+target_latency_ms = 50.0
+
+[graphics]
+target_fps = 60
+vsync = true
+window_width = 1280
+window_height = 720
+start_fullscreen = false
+multi_monitor = false
+texture_filtering = "Linear"
+
+[ui]
+show_fps = true
+show_audio_levels = true
+show_preset_name = true
+scale_factor = 1.0
+auto_hide_ui_seconds = 5.0

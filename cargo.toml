@@ -1,0 +1,70 @@
+[package]
+name = "wcr_viz"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A modern MilkDrop music visualizer clone written in Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/rustdrop"
+keywords = ["audio", "visualization", "music", "milkdrop", "graphics"]
+categories = ["multimedia::audio", "graphics", "visualization"]
+
+[dependencies]
+# Audio capture and processing
+cpal = "0.15"
+rodio = "0.21"
+rustfft = "6.2"
+realfft = "3.3"
+
+# Graphics and rendering
+wgpu = "25.0.0"
+winit = "0.30.11"
+pollster = "0.3"
+bytemuck = { version = "1.18", features = ["derive"] }
+image = "0.25"
+
+# Math and numerical processing
+num-complex = "0.4"
+num-traits = "0.2"
+
+# Async and threading
+tokio = { version = "1.0", features = ["full"] }
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Configuration and serialization
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+ron = "0.8"  # For preset files if needed
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Utilities
+clap = { version = "4.0", features = ["derive"] }
+
+[target.'cfg(windows)'.dependencies]
+# Windows-specific dependencies - simplified for now
+# We can add back specific Windows features if needed later
+# Most audio functionality should work through CPAL cross-platform
+
+[profile.release]
+# Optimizations for real-time audio/graphics performance
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+# Faster debug builds
+opt-level = 1
+
+[[bin]]
+name = "wcr-viz"
+path = "src/main.rs"
+
