@@ -242,6 +242,7 @@ pub trait UIRenderer {
     fn draw_text(&mut self, x: f32, y: f32, text: &str, color: [f32; 4]) -> Result<()>;
     fn draw_rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: [f32; 4]) -> Result<()>;
     fn draw_line(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, color: [f32; 4]) -> Result<()>;
+    fn get_window_dimensions(&self) -> (u32, u32);
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ winit = "0.30.11"
 pollster = "0.3"
 bytemuck = { version = "1.18", features = ["derive"] }
 image = "0.25"
+cgmath = "0.18"
 
 # Math and numerical processing
 num-complex = "0.4"

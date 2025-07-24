@@ -27,9 +27,9 @@ impl PresetOverlay {
     /// Create a new preset overlay
     pub fn new() -> Self {
         Self {
-            is_visible: true, // Always visible for testing
+            is_visible: false, // Start hidden
             current_preset_info: None,
-            show_menu: true, // Always show menu for testing
+            show_menu: false, // Start with menu hidden
             selected_category: 0,
             selected_preset: 0,
             categories: Vec::new(),
@@ -40,14 +40,12 @@ impl PresetOverlay {
     /// Show the overlay
     pub fn show(&mut self) {
         self.is_visible = true;
-        log::info!("🎨 Overlay: Show called, is_visible: {}", self.is_visible);
     }
     
     /// Hide the overlay
     pub fn hide(&mut self) {
         self.is_visible = false;
         self.show_menu = false;
-        log::info!("🎨 Overlay: Hide called, is_visible: {}, show_menu: {}", self.is_visible, self.show_menu);
     }
     
     /// Check if overlay is visible
@@ -73,14 +71,11 @@ impl PresetOverlay {
         self.show_menu = true;
         self.categories = navigator.get_categories();
         
-        log::info!("🎨 Overlay: Showing preset menu with {} categories", self.categories.len());
-        
         if !self.categories.is_empty() {
             self.selected_category = 0;
             self.selected_preset = 0;
             self.update_presets_for_category(navigator);
         } else {
-            log::warn!("🎨 Overlay: No categories available for preset menu");
             self.presets_in_category.clear();
         }
     }
@@ -124,10 +119,7 @@ impl PresetOverlay {
         
         let new_selection = (self.selected_category, self.selected_preset);
         if old_selection != new_selection {
-            log::info!("🎨 Overlay: Navigation changed from {:?} to {:?}", old_selection, new_selection);
-            log::info!("🎨 Overlay: Current category: '{}', presets: {}", 
-                      self.categories.get(self.selected_category).unwrap_or(&"None".to_string()),
-                      self.presets_in_category.len());
+            // No logging needed here, as it's a frequent operation
         }
     }
     
@@ -135,11 +127,8 @@ impl PresetOverlay {
     fn update_presets_for_category(&mut self, navigator: &PresetNavigator) {
         if let Some(category) = self.categories.get(self.selected_category) {
             self.presets_in_category = navigator.get_presets_in_category(category);
-            log::info!("🎨 Overlay: Updated presets for category '{}': {} presets", 
-                      category, self.presets_in_category.len());
         } else {
             self.presets_in_category.clear();
-            log::warn!("🎨 Overlay: No category found at index {}", self.selected_category);
         }
     }
     
@@ -154,41 +143,37 @@ impl PresetOverlay {
     
     /// Render the overlay
     pub fn render(&self, renderer: &mut dyn UIRenderer) -> Result<()> {
-        log::info!("🎨 Overlay: Starting render, visible: {}, show_menu: {}", self.is_visible, self.show_menu);
-        
         if !self.is_visible {
-            log::info!("🎨 Overlay: Not visible, skipping render");
             return Ok(());
         }
         
+        let (window_width, window_height) = renderer.get_window_dimensions();
+
         // Draw background overlay
-        log::info!("🎨 Overlay: Drawing background");
-        renderer.draw_rect(0.0, 0.0, 1920.0, 1080.0, [0.0, 0.0, 0.0, 0.7])?;
+        renderer.draw_rect(0.0, 0.0, window_width as f32, window_height as f32, [0.0, 0.0, 0.0, 0.7])?;
         
         if self.show_menu {
-            log::info!("🎨 Overlay: Rendering menu");
-            self.render_menu(renderer)?;
+            self.render_menu(renderer, window_width, window_height)?;
         } else {
-            log::info!("🎨 Overlay: Rendering info panel");
-            self.render_info_panel(renderer)?;
+            self.render_info_panel(renderer, window_width, window_height)?;
         }
         
         // Draw controls help
-        log::info!("🎨 Overlay: Rendering controls help");
-        self.render_controls_help(renderer)?;
+        self.render_controls_help(renderer, window_width, window_height)?;
         
-        log::info!("🎨 Overlay: Render complete");
         Ok(())
     }
     
     /// Render the info panel
-    fn render_info_panel(&self, renderer: &mut dyn UIRenderer) -> Result<()> {
-        let x = 50.0;
-        let mut y = 50.0;
+    fn render_info_panel(&self, renderer: &mut dyn UIRenderer, window_width: u32, window_height: u32) -> Result<()> {
+        let panel_width = 400.0;
+        let panel_height = 200.0;
+        let x = (window_width as f32 - panel_width) / 2.0; // Center horizontally
+        let mut y = (window_height as f32 - panel_height) / 2.0; // Center vertically
         let line_height = 30.0;
         
         // Draw info panel background
-        renderer.draw_rect(x - 10.0, y - 10.0, 400.0, 200.0, [0.1, 0.1, 0.1, 0.9])?;
+        renderer.draw_rect(x - 10.0, y - 10.0, panel_width + 20.0, panel_height + 20.0, [0.1, 0.1, 0.1, 0.9])?;
         
         // Title
         renderer.draw_text(x, y, "PRESET INFO", [1.0, 1.0, 1.0, 1.0])?;
@@ -226,20 +211,18 @@ impl PresetOverlay {
     }
     
     /// Render the preset selection menu
-    fn render_menu(&self, renderer: &mut dyn UIRenderer) -> Result<()> {
-        let x = 100.0;
-        let mut y = 100.0;
+    fn render_menu(&self, renderer: &mut dyn UIRenderer, window_width: u32, window_height: u32) -> Result<()> {
+        let menu_width = 930.0; // category_width + preset_width + 30.0
+        let menu_height = 600.0;
+        let x = (window_width as f32 - menu_width) / 2.0; // Center horizontally
+        let mut y = (window_height as f32 - menu_height) / 2.0; // Center vertically
         let line_height = 25.0;
         let category_width = 400.0; // Increased width for nested paths
-        let preset_width = 500.0;   // Increased width for preset names
+        let _preset_width = 500.0;   // Increased width for preset names
         let max_visible_items = 20; // Limit visible items to prevent overflow
         
-        log::info!("🎨 Menu: Rendering with {} categories, {} presets, selection: ({}, {})", 
-                  self.categories.len(), self.presets_in_category.len(), 
-                  self.selected_category, self.selected_preset);
-        
         // Draw menu background with better depth
-        renderer.draw_rect(x - 10.0, y - 10.0, category_width + preset_width + 30.0, 600.0, [0.1, 0.1, 0.1, 0.95])?;
+        renderer.draw_rect(x - 10.0, y - 10.0, menu_width + 20.0, menu_height + 20.0, [0.1, 0.1, 0.1, 0.95])?;
         
         // Title with better contrast
         renderer.draw_text(x, y, "PRESET SELECTION", [1.0, 1.0, 0.0, 1.0])?;
@@ -279,7 +262,7 @@ impl PresetOverlay {
         }
         
         // Presets section
-        y = 100.0 + line_height * 2.0;
+        y = (window_height as f32 - menu_height) / 2.0 + line_height * 2.0; // Reset y for presets
         renderer.draw_text(x + category_width + 20.0, y, "PRESETS:", [1.0, 1.0, 1.0, 1.0])?;
         y += line_height;
         
@@ -314,30 +297,32 @@ impl PresetOverlay {
         
         // Add scroll indicators if needed
         if start_category > 0 {
-            renderer.draw_text(x, 100.0 + line_height * 2.0, "↑", [0.7, 0.7, 0.7, 1.0])?;
+            renderer.draw_text(x, (window_height as f32 - menu_height) / 2.0 + line_height * 2.0, "↑", [0.7, 0.7, 0.7, 1.0])?;
         }
         if end_category < self.categories.len() {
-            renderer.draw_text(x, 100.0 + (max_visible_items + 2) as f32 * line_height, "↓", [0.7, 0.7, 0.7, 1.0])?;
+            renderer.draw_text(x, (window_height as f32 - menu_height) / 2.0 + (max_visible_items + 2) as f32 * line_height, "↓", [0.7, 0.7, 0.7, 1.0])?;
         }
         
         if start_preset > 0 {
-            renderer.draw_text(x + category_width + 20.0, 100.0 + line_height * 2.0, "↑", [0.7, 0.7, 0.7, 1.0])?;
+            renderer.draw_text(x + category_width + 20.0, (window_height as f32 - menu_height) / 2.0 + line_height * 2.0, "↑", [0.7, 0.7, 0.7, 1.0])?;
         }
         if end_preset < self.presets_in_category.len() {
-            renderer.draw_text(x + category_width + 20.0, 100.0 + (max_visible_items + 2) as f32 * line_height, "↓", [0.7, 0.7, 0.7, 1.0])?;
+            renderer.draw_text(x + category_width + 20.0, (window_height as f32 - menu_height) / 2.0 + (max_visible_items + 2) as f32 * line_height, "↓", [0.7, 0.7, 0.7, 1.0])?;
         }
         
         Ok(())
     }
     
     /// Render controls help
-    fn render_controls_help(&self, renderer: &mut dyn UIRenderer) -> Result<()> {
-        let x = 50.0;
-        let mut y = 900.0;
+    fn render_controls_help(&self, renderer: &mut dyn UIRenderer, window_width: u32, window_height: u32) -> Result<()> {
+        let panel_width = 500.0;
+        let panel_height = 150.0;
+        let x = (window_width as f32 - panel_width) / 2.0; // Center horizontally
+        let mut y = window_height as f32 - panel_height - 50.0; // Position at bottom
         let line_height = 25.0;
         
         // Draw help background
-        renderer.draw_rect(x - 10.0, y - 10.0, 500.0, 150.0, [0.1, 0.1, 0.1, 0.8])?;
+        renderer.draw_rect(x - 10.0, y - 10.0, panel_width + 20.0, panel_height + 20.0, [0.1, 0.1, 0.1, 0.8])?;
         
         // Title
         renderer.draw_text(x, y, "CONTROLS:", [1.0, 1.0, 0.0, 1.0])?;

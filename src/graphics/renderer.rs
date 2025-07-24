@@ -6,7 +6,11 @@ use wgpu::{util::DeviceExt, Buffer, Device, Queue, RenderPipeline, SurfaceConfig
 use crate::audio::AudioData;
 use crate::ui::UIRenderer;
 use crate::preset::{Preset, PresetManager, renderer::PresetRenderer};
-use fontdue::{Font, FontSettings};
+use fontdue::{Font, FontSettings, Metrics};
+use std::collections::HashMap;
+use std::convert::AsRef;
+
+
 
 
 /// Vertex structure for waveform lines
@@ -172,11 +176,6 @@ pub struct Renderer {
     
     // UI elements to render
     ui_elements: Vec<UIElement>,
-    
-    // Font system
-    font: Option<Font>,
-    
-    // Configuration
     window_width: u32,
     window_height: u32,
     
@@ -188,7 +187,17 @@ pub struct Renderer {
     // UI buffer management
     max_ui_vertices: usize,
     max_ui_indices: usize,
+
+    // Font rendering
+    font: Font,
+    font_texture: wgpu::Texture,
+    font_texture_view: wgpu::TextureView,
+    font_sampler: wgpu::Sampler,
+    char_data: HashMap<char, (Metrics, [f32; 4])>,
     
+    // UI Projection
+    projection_buffer: Buffer,
+
     // Preset rendering
     preset_renderer: PresetRenderer,
     preset_manager: Option<PresetManager>,
@@ -256,7 +265,43 @@ impl Renderer {
         // Create render pipeline for UI elements (triangles) with dedicated shader
         let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("UI Pipeline"),
-            layout: None,
+            layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("UI Pipeline Layout"),
+                bind_group_layouts: &[
+                    &device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                        label: Some("UI Bind Group Layout"),
+                        entries: &[
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 0,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Texture {
+                                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                    view_dimension: wgpu::TextureViewDimension::D2,
+                                    multisampled: false,
+                                },
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 1,
+                                visibility: wgpu::ShaderStages::FRAGMENT,
+                                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                                count: None,
+                            },
+                            wgpu::BindGroupLayoutEntry {
+                                binding: 2,
+                                visibility: wgpu::ShaderStages::VERTEX,
+                                ty: wgpu::BindingType::Buffer {
+                                    ty: wgpu::BufferBindingType::Uniform,
+                                    has_dynamic_offset: false,
+                                    min_binding_size: None,
+                                },
+                                count: None,
+                            },
+                        ],
+                    }),
+                ],
+                push_constant_ranges: &[],
+            })),
             vertex: wgpu::VertexState {
                 module: &ui_shader,
                 entry_point: Some("vs_main"),
@@ -290,6 +335,284 @@ impl Renderer {
             },
             multiview: None,
             cache: None,
+        });
+
+        // Create projection uniform buffer (will be updated in render_ui)
+        let projection_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Projection Buffer"),
+            contents: bytemuck::cast_slice(&[0.0f32; 16]), // Placeholder, will be updated
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // Note: Projection bind group is now part of the UI bind group (binding 2)
+        // This is handled in the render_ui function
+
+        // Font loading and texture atlas creation
+        let font_bytes = std::fs::read("assets/fonts/Inconsolata-Regular.ttf")?;
+        let font = Font::from_bytes(font_bytes, FontSettings::default()).map_err(|e| anyhow::anyhow!("Error loading font: {}", e))?;
+
+        // Create a font texture atlas
+        let font_size = 32.0; // Adjust font size as needed
+        let mut font_atlas_width = 0;
+        let mut font_atlas_height = 0;
+        let mut char_metrics: HashMap<char, (Metrics, [f32; 4])> = HashMap::new();
+
+        // First pass to determine atlas size and collect metrics
+        for char_code in 32..127 { // ASCII characters
+            let character = std::char::from_u32(char_code).unwrap();
+            let (metrics, _bitmap) = font.rasterize(character, font_size);
+            font_atlas_width += metrics.width + 1; // +1 for padding
+            font_atlas_height = font_atlas_height.max(metrics.height);
+            char_metrics.insert(character, (metrics, [0.0, 0.0, 0.0, 0.0]));
+        }
+
+        let font_atlas_width = font_atlas_width.max(1); // Ensure at least 1 pixel
+        let font_atlas_height = font_atlas_height.max(1);
+
+        let mut font_atlas_data = vec![0u8; font_atlas_width * font_atlas_height];
+        let mut current_x = 0;
+
+        // Second pass to rasterize and copy to atlas
+        for char_code in 32..127 {
+            let character = std::char::from_u32(char_code).unwrap();
+            let (metrics, bitmap) = font.rasterize(character, font_size);
+
+            for y in 0..metrics.height {
+                for x in 0..metrics.width {
+                    let atlas_idx = (current_x + x) + (y * font_atlas_width);
+                    let bitmap_idx = x + (y * metrics.width);
+                    font_atlas_data[atlas_idx] = bitmap[bitmap_idx];
+                }
+            }
+
+            let uv_x = current_x as f32 / font_atlas_width as f32;
+            let uv_y = 0.0;
+            let uv_w = metrics.width as f32 / font_atlas_width as f32;
+            let uv_h = metrics.height as f32 / font_atlas_height as f32;
+
+            char_metrics.insert(character, (metrics, [uv_x, uv_y, uv_w, uv_h]));
+            current_x += metrics.width + 1;
+        }
+
+        let font_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Font Atlas Texture"),
+            size: wgpu::Extent3d {
+                width: font_atlas_width as u32,
+                height: font_atlas_height as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm, // Single channel for font
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &font_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &font_atlas_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(font_atlas_width as u32),
+                rows_per_image: Some(font_atlas_height as u32),
+            },
+            font_texture.size(),
+        );
+
+        let font_texture_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Font Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Font loading and texture atlas creation
+        let font_bytes = std::fs::read("assets/fonts/Inconsolata-Regular.ttf")?;
+        let font = Font::from_bytes(font_bytes, FontSettings::default()).map_err(|e| anyhow::anyhow!("Error loading font: {}", e))?;
+
+        // Create a font texture atlas
+        let font_size = 32.0; // Adjust font size as needed
+        let mut font_atlas_width = 0;
+        let mut font_atlas_height = 0;
+        let mut char_data = HashMap::new();
+
+        // First pass to determine atlas size and collect metrics
+        for char_code in 32..127 { // ASCII characters
+            let character = std::char::from_u32(char_code).unwrap();
+            let (metrics, _bitmap) = font.rasterize(character, font_size);
+            font_atlas_width += metrics.width + 1; // +1 for padding
+            font_atlas_height = font_atlas_height.max(metrics.height);
+        }
+
+        let font_atlas_width = font_atlas_width.max(1); // Ensure at least 1 pixel
+        let font_atlas_height = font_atlas_height.max(1);
+
+        let mut font_atlas_data = vec![0u8; font_atlas_width * font_atlas_height];
+        let mut current_x = 0;
+
+        // Second pass to rasterize and copy to atlas
+        for char_code in 32..127 {
+            let character = std::char::from_u32(char_code).unwrap();
+            let (metrics, bitmap) = font.rasterize(character, font_size);
+
+            for y in 0..metrics.height {
+                for x in 0..metrics.width {
+                    let atlas_idx = (current_x + x) + (y * font_atlas_width);
+                    let bitmap_idx = x + (y * metrics.width);
+                    font_atlas_data[atlas_idx] = bitmap[bitmap_idx];
+                }
+            }
+
+            let uv_x = current_x as f32 / font_atlas_width as f32;
+            let uv_y = 0.0;
+            let uv_w = metrics.width as f32 / font_atlas_width as f32;
+            let uv_h = metrics.height as f32 / font_atlas_height as f32;
+
+            char_data.insert(character, (metrics, [uv_x, uv_y, uv_w, uv_h]));
+            current_x += metrics.width + 1;
+        }
+
+        let font_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Font Atlas Texture"),
+            size: wgpu::Extent3d {
+                width: font_atlas_width as u32,
+                height: font_atlas_height as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm, // Single channel for font
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &font_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &font_atlas_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(font_atlas_width as u32),
+                rows_per_image: Some(font_atlas_height as u32),
+            },
+            font_texture.size(),
+        );
+
+        let font_texture_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Font Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Font loading and texture atlas creation
+        let font_bytes = std::fs::read("assets/fonts/Inconsolata-Regular.ttf")?;
+        let font = Font::from_bytes(font_bytes, FontSettings::default()).map_err(|e| anyhow::anyhow!("Error loading font: {}", e))?;
+
+        // Create a font texture atlas
+        let font_size = 32.0; // Adjust font size as needed
+        let mut font_atlas_width = 0;
+        let mut font_atlas_height = 0;
+        let mut char_data = HashMap::new();
+
+        // First pass to determine atlas size and collect metrics
+        for char_code in 32..127 { // ASCII characters
+            let character = std::char::from_u32(char_code).unwrap();
+            let (metrics, _bitmap) = font.rasterize(character, font_size);
+            font_atlas_width += metrics.width + 1; // +1 for padding
+            font_atlas_height = font_atlas_height.max(metrics.height);
+        }
+
+        let font_atlas_width = font_atlas_width.max(1); // Ensure at least 1 pixel
+        let font_atlas_height = font_atlas_height.max(1);
+
+        let mut font_atlas_data = vec![0u8; font_atlas_width * font_atlas_height];
+        let mut current_x = 0;
+
+        // Second pass to rasterize and copy to atlas
+        for char_code in 32..127 {
+            let character = std::char::from_u32(char_code).unwrap();
+            let (metrics, bitmap) = font.rasterize(character, font_size);
+
+            for y in 0..metrics.height {
+                for x in 0..metrics.width {
+                    let atlas_idx = (current_x + x) + (y * font_atlas_width);
+                    let bitmap_idx = x + (y * metrics.width);
+                    font_atlas_data[atlas_idx] = bitmap[bitmap_idx];
+                }
+            }
+
+            let uv_x = current_x as f32 / font_atlas_width as f32;
+            let uv_y = 0.0;
+            let uv_w = metrics.width as f32 / font_atlas_width as f32;
+            let uv_h = metrics.height as f32 / font_atlas_height as f32;
+
+            char_data.insert(character, (metrics, [uv_x, uv_y, uv_w, uv_h]));
+            current_x += metrics.width + 1;
+        }
+
+        let font_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Font Atlas Texture"),
+            size: wgpu::Extent3d {
+                width: font_atlas_width as u32,
+                height: font_atlas_height as u32,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm, // Single channel for font
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &font_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &font_atlas_data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(font_atlas_width as u32),
+                rows_per_image: Some(font_atlas_height as u32),
+            },
+            font_texture.size(),
+        );
+
+        let font_texture_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let font_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Font Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
         });
 
         // Create preset shader
@@ -472,8 +795,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             WaveformLine::new("High", [0.0, 0.0, 1.0, 1.0], 1000),   // Blue for treble
         ];
 
-        // Try to load Arial font
-        let font = Self::load_arial_font();
+        
 
         // Create a simple texture for preset rendering
         let texture_size: u32 = 256;
@@ -528,7 +850,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             start_time: Instant::now(),
             waveform_lines,
             ui_elements: Vec::new(),
-            font,
+        
             window_width: config.width,
             window_height: config.height,
             max_vertices,
@@ -537,6 +859,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             current_index_count: 0,
             max_ui_vertices,
             max_ui_indices,
+            font,
+            font_texture,
+            font_texture_view,
+            font_sampler,
+            char_data,
+            projection_buffer,
             preset_renderer: PresetRenderer::new(),
             preset_manager: None,
             uniform_buffer: Some(uniform_buffer),
@@ -546,129 +874,9 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         })
     }
 
-    /// Load Arial font from Windows system fonts
-    fn load_arial_font() -> Option<Font> {
-        // Common Windows font paths
-        let font_paths = [
-            "C:\\Windows\\Fonts\\arial.ttf",
-            "C:\\Windows\\Fonts\\Arial.ttf",
-            "C:\\Windows\\Fonts\\ARIAL.TTF",
-        ];
+    
 
-        for path in &font_paths {
-            if let Ok(font_data) = std::fs::read(path) {
-                if let Ok(font) = Font::from_bytes(font_data, FontSettings::default()) {
-                    log::info!("✅ Loaded Arial font from: {}", path);
-                    return Some(font);
-                }
-            }
-        }
-
-        // Fallback: create a simple bitmap font
-        log::warn!("⚠️ Could not load Arial font, using fallback");
-        None
-    }
-
-    /// Get bitmap pattern for a character (8x12 pixel font)
-    fn get_char_pattern(ch: char) -> [u8; 12] {
-        match ch {
-            'A' => [0x18, 0x24, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x00, 0x00],
-            'B' => [0x7C, 0x42, 0x42, 0x42, 0x7C, 0x42, 0x42, 0x42, 0x42, 0x7C, 0x00, 0x00],
-            'C' => [0x3C, 0x42, 0x42, 0x40, 0x40, 0x40, 0x40, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            'D' => [0x78, 0x44, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x44, 0x78, 0x00, 0x00],
-            'E' => [0x7E, 0x40, 0x40, 0x40, 0x7C, 0x40, 0x40, 0x40, 0x40, 0x7E, 0x00, 0x00],
-            'F' => [0x7E, 0x40, 0x40, 0x40, 0x7C, 0x40, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00],
-            'G' => [0x3C, 0x42, 0x42, 0x40, 0x40, 0x4E, 0x42, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            'H' => [0x42, 0x42, 0x42, 0x42, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x00, 0x00],
-            'I' => [0x3E, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x3E, 0x00, 0x00],
-            'J' => [0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            'K' => [0x42, 0x44, 0x48, 0x50, 0x60, 0x50, 0x48, 0x44, 0x42, 0x42, 0x00, 0x00],
-            'L' => [0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x7E, 0x00, 0x00],
-            'M' => [0x42, 0x66, 0x5A, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x00, 0x00],
-            'N' => [0x42, 0x62, 0x52, 0x4A, 0x46, 0x42, 0x42, 0x42, 0x42, 0x42, 0x00, 0x00],
-            'O' => [0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            'P' => [0x7C, 0x42, 0x42, 0x42, 0x7C, 0x40, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00],
-            'Q' => [0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x4A, 0x44, 0x3A, 0x00, 0x00],
-            'R' => [0x7C, 0x42, 0x42, 0x42, 0x7C, 0x48, 0x44, 0x42, 0x42, 0x42, 0x00, 0x00],
-            'S' => [0x3C, 0x42, 0x42, 0x40, 0x30, 0x0C, 0x02, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            'T' => [0x7F, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00],
-            'U' => [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            'V' => [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x24, 0x18, 0x00, 0x00, 0x00],
-            'W' => [0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x5A, 0x66, 0x42, 0x00, 0x00],
-            'X' => [0x42, 0x42, 0x24, 0x18, 0x18, 0x18, 0x24, 0x42, 0x42, 0x42, 0x00, 0x00],
-            'Y' => [0x42, 0x42, 0x24, 0x18, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00],
-            'Z' => [0x7E, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x42, 0x42, 0x7E, 0x00, 0x00],
-            'a' => [0x00, 0x00, 0x3C, 0x02, 0x3E, 0x42, 0x42, 0x42, 0x3E, 0x00, 0x00, 0x00],
-            'b' => [0x40, 0x40, 0x7C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7C, 0x00, 0x00, 0x00],
-            'c' => [0x00, 0x00, 0x3C, 0x42, 0x40, 0x40, 0x40, 0x42, 0x3C, 0x00, 0x00, 0x00],
-            'd' => [0x02, 0x02, 0x3E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3E, 0x00, 0x00, 0x00],
-            'e' => [0x00, 0x00, 0x3C, 0x42, 0x42, 0x7E, 0x40, 0x42, 0x3C, 0x00, 0x00, 0x00],
-            'f' => [0x0C, 0x12, 0x10, 0x7C, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00, 0x00],
-            'g' => [0x00, 0x00, 0x3E, 0x42, 0x42, 0x42, 0x3E, 0x02, 0x42, 0x3C, 0x00, 0x00],
-            'h' => [0x40, 0x40, 0x7C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x00, 0x00, 0x00],
-            'i' => [0x08, 0x00, 0x38, 0x08, 0x08, 0x08, 0x08, 0x08, 0x3E, 0x00, 0x00, 0x00],
-            'j' => [0x04, 0x00, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x44, 0x38, 0x00, 0x00],
-            'k' => [0x40, 0x40, 0x42, 0x44, 0x48, 0x70, 0x48, 0x44, 0x42, 0x00, 0x00, 0x00],
-            'l' => [0x38, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x3E, 0x00, 0x00, 0x00],
-            'm' => [0x00, 0x00, 0x76, 0x49, 0x49, 0x49, 0x49, 0x49, 0x49, 0x00, 0x00, 0x00],
-            'n' => [0x00, 0x00, 0x7C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x00, 0x00, 0x00],
-            'o' => [0x00, 0x00, 0x3C, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00, 0x00, 0x00],
-            'p' => [0x00, 0x00, 0x7C, 0x42, 0x42, 0x42, 0x7C, 0x40, 0x40, 0x40, 0x00, 0x00],
-            'q' => [0x00, 0x00, 0x3E, 0x42, 0x42, 0x42, 0x3E, 0x02, 0x02, 0x02, 0x00, 0x00],
-            'r' => [0x00, 0x00, 0x7C, 0x42, 0x40, 0x40, 0x40, 0x40, 0x40, 0x00, 0x00, 0x00],
-            's' => [0x00, 0x00, 0x3E, 0x40, 0x3C, 0x02, 0x02, 0x42, 0x3C, 0x00, 0x00, 0x00],
-            't' => [0x10, 0x10, 0x7C, 0x10, 0x10, 0x10, 0x10, 0x12, 0x0C, 0x00, 0x00, 0x00],
-            'u' => [0x00, 0x00, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x3E, 0x00, 0x00, 0x00],
-            'v' => [0x00, 0x00, 0x42, 0x42, 0x42, 0x42, 0x24, 0x18, 0x00, 0x00, 0x00, 0x00],
-            'w' => [0x00, 0x00, 0x49, 0x49, 0x49, 0x49, 0x49, 0x49, 0x36, 0x00, 0x00, 0x00],
-            'x' => [0x00, 0x00, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x42, 0x00, 0x00, 0x00],
-            'y' => [0x00, 0x00, 0x42, 0x42, 0x42, 0x42, 0x3E, 0x02, 0x42, 0x3C, 0x00, 0x00],
-            'z' => [0x00, 0x00, 0x7E, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7E, 0x00, 0x00, 0x00],
-            '0' => [0x3C, 0x42, 0x42, 0x46, 0x4A, 0x52, 0x62, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            '1' => [0x08, 0x18, 0x28, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x3E, 0x00, 0x00],
-            '2' => [0x3C, 0x42, 0x42, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x7E, 0x00, 0x00],
-            '3' => [0x3C, 0x42, 0x42, 0x02, 0x0C, 0x02, 0x02, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            '4' => [0x04, 0x0C, 0x14, 0x24, 0x44, 0x7E, 0x04, 0x04, 0x04, 0x04, 0x00, 0x00],
-            '5' => [0x7E, 0x40, 0x40, 0x7C, 0x02, 0x02, 0x02, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            '6' => [0x3C, 0x42, 0x40, 0x40, 0x7C, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            '7' => [0x7E, 0x02, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x00, 0x00],
-            '8' => [0x3C, 0x42, 0x42, 0x42, 0x3C, 0x42, 0x42, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            '9' => [0x3C, 0x42, 0x42, 0x42, 0x3E, 0x02, 0x02, 0x42, 0x42, 0x3C, 0x00, 0x00],
-            '!' => [0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00],
-            '?' => [0x3C, 0x42, 0x42, 0x02, 0x04, 0x08, 0x08, 0x00, 0x08, 0x08, 0x00, 0x00],
-            '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00],
-            ',' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30, 0x00, 0x00],
-            ':' => [0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00],
-            ';' => [0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30, 0x00, 0x00],
-            '-' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            '_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00],
-            '=' => [0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00],
-            '+' => [0x00, 0x00, 0x08, 0x08, 0x08, 0x7F, 0x08, 0x08, 0x08, 0x00, 0x00, 0x00],
-            '*' => [0x00, 0x00, 0x08, 0x2A, 0x1C, 0x7F, 0x1C, 0x2A, 0x08, 0x00, 0x00, 0x00],
-            '/' => [0x00, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00],
-            '\\' => [0x00, 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x02, 0x00, 0x00, 0x00, 0x00],
-            '(' => [0x0C, 0x10, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x10, 0x0C, 0x00, 0x00],
-            ')' => [0x30, 0x08, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x08, 0x30, 0x00, 0x00],
-            '[' => [0x3E, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x3E, 0x00, 0x00],
-            ']' => [0x7C, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x7C, 0x00, 0x00],
-            '{' => [0x0E, 0x10, 0x10, 0x10, 0x60, 0x10, 0x10, 0x10, 0x10, 0x0E, 0x00, 0x00],
-            '}' => [0x70, 0x08, 0x08, 0x08, 0x06, 0x08, 0x08, 0x08, 0x08, 0x70, 0x00, 0x00],
-            '<' => [0x00, 0x06, 0x18, 0x60, 0x80, 0x60, 0x18, 0x06, 0x00, 0x00, 0x00, 0x00],
-            '>' => [0x00, 0xC0, 0x30, 0x0C, 0x02, 0x0C, 0x30, 0xC0, 0x00, 0x00, 0x00, 0x00],
-            '|' => [0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x00, 0x00],
-            '&' => [0x3C, 0x42, 0x42, 0x42, 0x3C, 0x42, 0x42, 0x42, 0x3C, 0x02, 0x00, 0x00],
-            '@' => [0x3C, 0x42, 0x42, 0x4E, 0x52, 0x4E, 0x40, 0x42, 0x3C, 0x00, 0x00, 0x00],
-            '#' => [0x12, 0x12, 0x12, 0x7F, 0x12, 0x12, 0x7F, 0x12, 0x12, 0x12, 0x00, 0x00],
-            '$' => [0x08, 0x3E, 0x49, 0x48, 0x3E, 0x09, 0x09, 0x49, 0x3E, 0x08, 0x00, 0x00],
-            '%' => [0x61, 0x92, 0x94, 0x68, 0x08, 0x10, 0x16, 0x29, 0x49, 0x86, 0x00, 0x00],
-            '^' => [0x18, 0x24, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            '~' => [0x00, 0x00, 0x00, 0x32, 0x4C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            '`' => [0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            '\'' => [0x10, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            '"' => [0x24, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-            _ => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // Unknown character
-        }
-    }
+    
 
     /// Set the preset manager for rendering presets
     pub fn set_preset_manager(&mut self, preset_manager: PresetManager) {
@@ -892,14 +1100,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         for element in &self.ui_elements {
             match &element.element_type {
                 UIElementType::Rectangle => {
-                    // Convert screen coordinates to normalized device coordinates
-                    let screen_width = self.window_width as f32;
-                    let screen_height = self.window_height as f32;
-                    
-                    let x1 = (element.x / screen_width) * 2.0 - 1.0;
-                    let y1 = 1.0 - (element.y / screen_height) * 2.0; // Flip Y coordinate
-                    let x2 = ((element.x + element.width) / screen_width) * 2.0 - 1.0;
-                    let y2 = 1.0 - ((element.y + element.height) / screen_height) * 2.0;
+                    // Use screen coordinates directly
+                    let x1 = element.x;
+                    let y1 = element.y;
+                    let x2 = element.x + element.width;
+                    let y2 = element.y + element.height;
                     
                     // Create rectangle vertices (two triangles)
                     let start_idx = ui_vertices.len();
@@ -912,64 +1117,48 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                     
                     // Create indices for two triangles
                     ui_indices.extend_from_slice(&[
-                        start_idx, start_idx + 1, start_idx + 2,
-                        start_idx + 1, start_idx + 3, start_idx + 2
+                        start_idx as u32, (start_idx + 1) as u32, (start_idx + 2) as u32,
+                        (start_idx + 1) as u32, (start_idx + 3) as u32, (start_idx + 2) as u32
                     ]);
                 }
                 UIElementType::Text => {
-                    // Render text using a simple bitmap font approach for readability
                     if let Some(text) = &element.text {
-                        let screen_width = self.window_width as f32;
-                        let screen_height = self.window_height as f32;
-                        
-                        // Simple bitmap font - each character is 8x12 pixels
-                        let char_width = 8.0;
-                        let char_height = 12.0;
-                        let char_spacing = 2.0;
-                        
                         let mut x_offset = 0.0;
                         
                         for ch in text.chars() {
-                            if ch == ' ' {
-                                x_offset += char_width * 0.5;
-                                continue;
+                            if let Some((metrics, uv_rect)) = self.char_data.get(&ch) {
+                                let char_x = element.x + x_offset + metrics.xmin as f32;
+                                let char_y = element.y + metrics.ymin as f32;
+                                
+                                let x1 = char_x;
+                                let y1 = char_y;
+                                let x2 = char_x + metrics.width as f32;
+                                let y2 = char_y + metrics.height as f32;
+                                
+                                let start_idx = ui_vertices.len() as u16;
+                                ui_vertices.extend_from_slice(&[
+                                    Vertex { position: [x1, y1], color: element.color, tex_coords: [uv_rect[0], uv_rect[1]] },
+                                    Vertex { position: [x2, y1], color: element.color, tex_coords: [uv_rect[0] + uv_rect[2], uv_rect[1]] },
+                                    Vertex { position: [x1, y2], color: element.color, tex_coords: [uv_rect[0], uv_rect[1] + uv_rect[3]] },
+                                    Vertex { position: [x2, y2], color: element.color, tex_coords: [uv_rect[0] + uv_rect[2], uv_rect[1] + uv_rect[3]] },
+                                ]);
+                                
+                                ui_indices.extend_from_slice(&[
+                                    start_idx as u32, (start_idx + 1) as u32, (start_idx + 2) as u32,
+                                    (start_idx + 1) as u32, (start_idx + 3) as u32, (start_idx + 2) as u32
+                                ]);
+                                
+                                x_offset += metrics.advance_width;
                             }
-                            
-                            let char_x = element.x + x_offset;
-                            let char_y = element.y;
-                            
-                            // Render each character as a single quad (much more efficient)
-                            let x1 = (char_x / screen_width) * 2.0 - 1.0;
-                            let y1 = 1.0 - (char_y / screen_height) * 2.0;
-                            let x2 = ((char_x + char_width) / screen_width) * 2.0 - 1.0;
-                            let y2 = 1.0 - ((char_y + char_height) / screen_height) * 2.0;
-                            
-                            let start_idx = ui_vertices.len();
-                            ui_vertices.extend_from_slice(&[
-                                Vertex { position: [x1, y1], color: element.color, tex_coords: [0.0, 0.0] },
-                                Vertex { position: [x2, y1], color: element.color, tex_coords: [1.0, 0.0] },
-                                Vertex { position: [x1, y2], color: element.color, tex_coords: [0.0, 1.0] },
-                                Vertex { position: [x2, y2], color: element.color, tex_coords: [1.0, 1.0] },
-                            ]);
-                            
-                            ui_indices.extend_from_slice(&[
-                                start_idx, start_idx + 1, start_idx + 2,
-                                start_idx + 1, start_idx + 3, start_idx + 2
-                            ]);
-                            
-                            x_offset += char_width + char_spacing;
                         }
                     }
                 }
                 UIElementType::Line { x2, y2 } => {
-                    // Convert to line strip vertices
-                    let screen_width = self.window_width as f32;
-                    let screen_height = self.window_height as f32;
-                    
-                    let x1_norm = (element.x / screen_width) * 2.0 - 1.0;
-                    let y1_norm = 1.0 - (element.y / screen_height) * 2.0;
-                    let x2_norm = (*x2 / screen_width) * 2.0 - 1.0;
-                    let y2_norm = 1.0 - (*y2 / screen_height) * 2.0;
+                    // Use screen coordinates directly
+                    let x1_norm = element.x;
+                    let y1_norm = element.y;
+                    let x2_norm = *x2;
+                    let y2_norm = *y2;
                     
                     let start_idx = ui_vertices.len();
                     ui_vertices.extend_from_slice(&[
@@ -977,13 +1166,14 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         Vertex { position: [x2_norm, y2_norm], color: element.color, tex_coords: [1.0, 1.0] },
                     ]);
                     
-                    ui_indices.extend_from_slice(&[start_idx, start_idx + 1]);
+                    ui_indices.extend_from_slice(&[start_idx as u32, (start_idx + 1) as u32]);
                 }
             }
         }
 
         // Update buffers with UI data
         if !ui_vertices.is_empty() {
+            log::info!("Rendering UI: {} vertices, {} indices", ui_vertices.len(), ui_indices.len());
             // Check if we need to resize UI buffers
             if ui_vertices.len() > self.max_ui_vertices {
                 log::warn!("UI vertex count ({}) exceeds buffer capacity ({}), truncating", 
@@ -1019,6 +1209,32 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             render_pass.set_pipeline(&self.ui_pipeline);
             render_pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
             render_pass.set_index_buffer(self.ui_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            
+            // Update projection matrix for screen coordinates with correct Y-axis
+            let projection_matrix = cgmath::ortho(0.0, self.window_width as f32, 0.0, self.window_height as f32, -1.0, 1.0);
+            self.queue.write_buffer(&self.projection_buffer, 0, bytemuck::cast_slice(<cgmath::Matrix4<f32> as AsRef<[f32; 16]>>::as_ref(&projection_matrix)));
+
+            // Create UI bind group with all three bindings (texture, sampler, projection)
+            let ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("UI Bind Group"),
+                layout: &self.ui_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.font_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.font_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.projection_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+            render_pass.set_bind_group(0, &ui_bind_group, &[]);
+
             render_pass.draw_indexed(0..ui_indices.len() as u32, 0, 0..1);
         }
         
@@ -1077,13 +1293,12 @@ impl UIRenderer for Renderer {
             element_type: UIElementType::Text,
             x,
             y,
-            width: text.len() as f32 * 20.0, // Better approximate width for larger font
-            height: 32.0, // Font height
+            width: 0.0, // Width will be calculated per character
+            height: 0.0, // Height will be calculated per character
             color,
             text: Some(text.to_string()),
         });
         
-        log::info!("🎨 UI Text: '{}' at ({}, {}) with color {:?}", text, x, y, color);
         Ok(())
     }
     
@@ -1099,8 +1314,6 @@ impl UIRenderer for Renderer {
             text: None,
         });
         
-        log::info!("🎨 UI Rect: ({}, {}) {}x{} with color {:?} - Created 4 vertices", 
-                  x, y, width, height, color);
         Ok(())
     }
     
@@ -1116,7 +1329,10 @@ impl UIRenderer for Renderer {
             text: None,
         });
         
-        log::info!("🎨 UI Line: ({}, {}) to ({}, {}) with color {:?}", x1, y1, x2, y2, color);
         Ok(())
+    }
+
+    fn get_window_dimensions(&self) -> (u32, u32) {
+        (self.window_width, self.window_height)
     }
 }

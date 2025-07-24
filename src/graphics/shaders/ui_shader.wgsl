@@ -10,11 +10,14 @@ struct VertexOutput {
     @location(1) tex_coords: vec2<f32>,
 }
 
+@group(0) @binding(0) var font_texture: texture_2d<f32>;
+@group(0) @binding(1) var font_sampler: sampler;
+@group(0) @binding(2) var<uniform> projection: mat4x4<f32>;
+
 @vertex
 fn vs_main(input: VertexInput) -> VertexOutput {
     var output: VertexOutput;
-    // Direct 2D projection without any 3D transformations
-    output.position = vec4<f32>(input.position, 0.0, 1.0);
+    output.position = projection * vec4<f32>(input.position, 0.0, 1.0);
     output.color = input.color;
     output.tex_coords = input.tex_coords;
     return output;
@@ -22,6 +25,8 @@ fn vs_main(input: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-    // Simple flat color rendering for UI elements
-    return input.color;
+    // Sample the font texture
+    let font_alpha = textureSample(font_texture, font_sampler, input.tex_coords).r;
+    // Use the alpha to blend the font color with the background
+    return vec4<f32>(input.color.rgb, input.color.a * font_alpha);
 } 
