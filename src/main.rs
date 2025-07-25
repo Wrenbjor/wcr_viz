@@ -9,6 +9,7 @@ mod config;
 mod graphics;
 mod preset;
 mod ui;
+mod iced_integration;
 
 use audio::AudioSystem;
 use config::Config;

@@ -6,7 +6,9 @@ use wgpu::{util::DeviceExt, Buffer, Device, Queue, RenderPipeline, SurfaceConfig
 use crate::audio::AudioData;
 use crate::ui::UIRenderer;
 use crate::preset::{Preset, PresetManager, renderer::PresetRenderer};
-use fontdue::{Font, FontSettings, Metrics};
+use swash::{FontRef, zeno};
+use swash::scale::ScaleContext;
+
 use std::collections::HashMap;
 use std::convert::AsRef;
 
@@ -189,11 +191,12 @@ pub struct Renderer {
     max_ui_indices: usize,
 
     // Font rendering
-    font: Font,
+    font_data: Vec<u8>,
     font_texture: wgpu::Texture,
     font_texture_view: wgpu::TextureView,
     font_sampler: wgpu::Sampler,
-    char_data: HashMap<char, (Metrics, [f32; 4])>,
+    char_data: HashMap<char, ([f32; 4], f32, f32)>, // UV coords, advance_width, height
+    scale_context: ScaleContext,
     
     // UI Projection
     projection_buffer: Buffer,
@@ -347,51 +350,105 @@ impl Renderer {
         // Note: Projection bind group is now part of the UI bind group (binding 2)
         // This is handled in the render_ui function
 
-        // Font loading and texture atlas creation
-        let font_bytes = std::fs::read("assets/fonts/Inconsolata-Regular.ttf")?;
-        let font = Font::from_bytes(font_bytes, FontSettings::default()).map_err(|e| anyhow::anyhow!("Error loading font: {}", e))?;
+        // Font loading and texture atlas creation - try Arial first, fallback to Inconsolata
+        let font_data = std::fs::read("C:/Windows/Fonts/arial.ttf")
+            .or_else(|_| std::fs::read("C:/Windows/Fonts/Arial.ttf"))
+            .or_else(|_| std::fs::read("assets/fonts/Inconsolata-Regular.ttf"))?;
 
-        // Create a font texture atlas
+        // Create Swash scale context
+        let mut scale_context = ScaleContext::new();
+        
+        // Parse font with Swash
+        let font_ref = FontRef::from_index(&font_data, 0).ok_or_else(|| anyhow::anyhow!("Failed to parse font"))?;
+        
+        // Create a font texture atlas using Swash
         let font_size = 32.0; // Adjust font size as needed
         let mut font_atlas_width = 0;
         let mut font_atlas_height = 0;
-        let mut char_metrics: HashMap<char, (Metrics, [f32; 4])> = HashMap::new();
+        let mut char_metrics: HashMap<char, ([f32; 4], f32, f32)> = HashMap::new();
+
+        // Create scaler
+        let mut scaler = scale_context
+            .builder(font_ref)
+            .size(font_size)
+            .hint(true)
+            .build();
 
         // First pass to determine atlas size and collect metrics
+        let mut max_height = 0;
+        let mut glyph_data = Vec::new();
+        
         for char_code in 32..127 { // ASCII characters
             let character = std::char::from_u32(char_code).unwrap();
-            let (metrics, _bitmap) = font.rasterize(character, font_size);
-            font_atlas_width += metrics.width + 1; // +1 for padding
-            font_atlas_height = font_atlas_height.max(metrics.height);
-            char_metrics.insert(character, (metrics, [0.0, 0.0, 0.0, 0.0]));
+            let glyph_id = font_ref.charmap().map(character);
+            
+            if glyph_id != 0 { // 0 means no glyph for this character
+                let outline = scaler.scale_outline(glyph_id);
+                let advance = font_size * 0.6; // Simple advance for now
+                
+                if let Some(outline) = outline {
+                    // Convert outline to bitmap using zeno
+                    let bounds = outline.bounds();
+                    let width = (bounds.max.x - bounds.min.x).ceil() as usize;
+                    let height = (bounds.max.y - bounds.min.y).ceil() as usize;
+                    
+                    font_atlas_width += width + 1; // +1 for padding
+                    max_height = max_height.max(height);
+                    
+                    glyph_data.push((character, outline, advance, width, height));
+                } else {
+                    // Fallback for characters without outlines (like spaces)
+                    let char_width = advance.max(8.0) as usize;
+                    font_atlas_width += char_width + 1; // minimum width for spaces
+                    glyph_data.push((character, outline, advance, char_width, 16));
+                }
+            }
         }
 
         let font_atlas_width = font_atlas_width.max(1); // Ensure at least 1 pixel
-        let font_atlas_height = font_atlas_height.max(1);
+        let font_atlas_height = max_height.max(1); // Use consistent height for all characters
+        
+        log::info!("Font atlas: {}x{} pixels, {} characters", font_atlas_width, font_atlas_height, glyph_data.len());
 
         let mut font_atlas_data = vec![0u8; font_atlas_width * font_atlas_height];
         let mut current_x = 0;
 
-        // Second pass to rasterize and copy to atlas
-        for char_code in 32..127 {
-            let character = std::char::from_u32(char_code).unwrap();
-            let (metrics, bitmap) = font.rasterize(character, font_size);
-
-            for y in 0..metrics.height {
-                for x in 0..metrics.width {
-                    let atlas_idx = (current_x + x) + (y * font_atlas_width);
-                    let bitmap_idx = x + (y * metrics.width);
-                    font_atlas_data[atlas_idx] = bitmap[bitmap_idx];
+        // Second pass to rasterize and copy to atlas using Swash
+        for (character, outline_opt, advance, width, height) in glyph_data {
+            // Place all characters at the baseline (bottom of atlas)
+            let y_offset = font_atlas_height - height;
+            
+            if let Some(outline) = outline_opt {
+                // Render outline to bitmap using zeno
+                let bounds = outline.bounds();
+                let mut bitmap = vec![0u8; width * height];
+                
+                // Create a simple rasterizer using zeno
+                zeno::Mask::new(&outline)
+                    .size(width, height)
+                    .offset(-bounds.min.x, -bounds.min.y)
+                    .render_into(&mut bitmap, None);
+                
+                // Copy bitmap to atlas
+                for y in 0..height {
+                    for x in 0..width {
+                        let atlas_idx = (current_x + x) + ((y + y_offset) * font_atlas_width);
+                        let bitmap_idx = x + (y * width);
+                        if atlas_idx < font_atlas_data.len() && bitmap_idx < bitmap.len() {
+                            font_atlas_data[atlas_idx] = bitmap[bitmap_idx];
+                        }
+                    }
                 }
             }
 
-            let uv_x = current_x as f32 / font_atlas_width as f32;
-            let uv_y = 0.0;
-            let uv_w = metrics.width as f32 / font_atlas_width as f32;
-            let uv_h = metrics.height as f32 / font_atlas_height as f32;
+            // Calculate UV coordinates as [x1, y1, x2, y2] (corners, not x/y/w/h)
+            let uv_x1 = current_x as f32 / font_atlas_width as f32;
+            let uv_y1 = y_offset as f32 / font_atlas_height as f32;
+            let uv_x2 = (current_x + width) as f32 / font_atlas_width as f32;
+            let uv_y2 = (y_offset + height) as f32 / font_atlas_height as f32;
 
-            char_metrics.insert(character, (metrics, [uv_x, uv_y, uv_w, uv_h]));
-            current_x += metrics.width + 1;
+            char_metrics.insert(character, ([uv_x1, uv_y1, uv_x2, uv_y2], advance, height as f32));
+            current_x += width + 1;
         }
 
         let font_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -859,11 +916,12 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             current_index_count: 0,
             max_ui_vertices,
             max_ui_indices,
-            font,
+            font_data,
             font_texture,
             font_texture_view,
             font_sampler,
             char_data,
+            scale_context,
             projection_buffer,
             preset_renderer: PresetRenderer::new(),
             preset_manager: None,
@@ -929,6 +987,14 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
             label: Some("Render Encoder"),
         });
 
+        self.render_with_encoder(view, &mut encoder)?;
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        
+        Ok(())
+    }
+
+    pub fn render_with_encoder(&mut self, view: &wgpu::TextureView, encoder: &mut wgpu::CommandEncoder) -> Result<()> {
         // Check if we have a preset to render and clone it to avoid borrow conflicts
         let preset_to_render = if let Some(ref preset_manager) = self.preset_manager {
             preset_manager.current_preset().cloned()
@@ -939,20 +1005,11 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         // Render based on what we have
         if let Some(preset) = preset_to_render {
             // Render preset instead of waveform
-            self.render_preset(&mut encoder, view, &preset)?;
+            self.render_preset(encoder, view, &preset)?;
         } else {
             // Fall back to waveform rendering
-            self.render_waveform(&mut encoder, view)?;
+            self.render_waveform(encoder, view)?;
         }
-
-        // Render UI overlay
-        self.render_ui(&mut encoder, view)?;
-
-        self.queue.submit(std::iter::once(encoder.finish()));
-        
-        // Clear UI elements for next frame and pre-allocate capacity
-        self.ui_elements.clear();
-        self.ui_elements.reserve(100); // Pre-allocate space for typical UI element count
         
         Ok(())
     }
@@ -1126,21 +1183,21 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                         let mut x_offset = 0.0;
                         
                         for ch in text.chars() {
-                            if let Some((metrics, uv_rect)) = self.char_data.get(&ch) {
-                                let char_x = element.x + x_offset + metrics.xmin as f32;
-                                let char_y = element.y + metrics.ymin as f32;
+                            if let Some((uv_rect, advance_width, char_height)) = self.char_data.get(&ch) {
+                                let char_x = element.x + x_offset;
+                                let char_y = element.y;
                                 
                                 let x1 = char_x;
                                 let y1 = char_y;
-                                let x2 = char_x + metrics.width as f32;
-                                let y2 = char_y + metrics.height as f32;
+                                let x2 = char_x + advance_width;
+                                let y2 = char_y + char_height;
                                 
                                 let start_idx = ui_vertices.len() as u16;
                                 ui_vertices.extend_from_slice(&[
                                     Vertex { position: [x1, y1], color: element.color, tex_coords: [uv_rect[0], uv_rect[1]] },
-                                    Vertex { position: [x2, y1], color: element.color, tex_coords: [uv_rect[0] + uv_rect[2], uv_rect[1]] },
-                                    Vertex { position: [x1, y2], color: element.color, tex_coords: [uv_rect[0], uv_rect[1] + uv_rect[3]] },
-                                    Vertex { position: [x2, y2], color: element.color, tex_coords: [uv_rect[0] + uv_rect[2], uv_rect[1] + uv_rect[3]] },
+                                    Vertex { position: [x2, y1], color: element.color, tex_coords: [uv_rect[2], uv_rect[1]] },
+                                    Vertex { position: [x1, y2], color: element.color, tex_coords: [uv_rect[0], uv_rect[3]] },
+                                    Vertex { position: [x2, y2], color: element.color, tex_coords: [uv_rect[2], uv_rect[3]] },
                                 ]);
                                 
                                 ui_indices.extend_from_slice(&[
@@ -1148,7 +1205,7 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
                                     (start_idx + 1) as u32, (start_idx + 3) as u32, (start_idx + 2) as u32
                                 ]);
                                 
-                                x_offset += metrics.advance_width;
+                                x_offset += advance_width;
                             }
                         }
                     }
@@ -1247,6 +1304,139 @@ fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
         self.window_height = height;
     }
     
+    /// Render overlay text on top of the scene
+    pub fn render_overlay_text(&mut self, encoder: &mut wgpu::CommandEncoder, view: &wgpu::TextureView, overlay_text: &[String]) -> Result<()> {
+        if overlay_text.is_empty() {
+            return Ok(());
+        }
+
+        // Calculate text positions (simple layout from top-left)
+        let start_x = 20.0; // 20px from left edge
+        let start_y = 20.0; // 20px from top edge
+        let line_height = 30.0; // 30px between lines to accommodate larger font
+        let font_size = 32.0; // Much larger font size for readability
+
+        // Create UI vertices from overlay text - IMPORTANT: use u16 to match buffer type
+        let mut ui_vertices = Vec::new();
+        let mut ui_indices: Vec<u16> = Vec::new();
+        
+        let mut current_y = start_y;
+        
+        // Render each line of text using proper font rendering
+        for line in overlay_text {
+            if !line.is_empty() {
+                self.add_text_to_buffers(&mut ui_vertices, &mut ui_indices, start_x, current_y, line, font_size, [1.0, 1.0, 1.0, 0.9]); // White text with slight transparency
+            }
+            current_y += line_height;
+        }
+
+        // Upload UI vertex and index data and render
+        if !ui_vertices.is_empty() {
+            log::debug!("Rendering overlay text: {} vertices, {} indices", ui_vertices.len(), ui_indices.len());
+
+            // Upload vertex and index data
+            self.queue.write_buffer(&self.ui_vertex_buffer, 0, bytemuck::cast_slice(&ui_vertices));
+            self.queue.write_buffer(&self.ui_index_buffer, 0, bytemuck::cast_slice(&ui_indices));
+
+            // Create projection matrix for UI coordinates
+            let projection_matrix = [
+                [2.0 / self.window_width as f32, 0.0, 0.0, 0.0],
+                [0.0, -2.0 / self.window_height as f32, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [-1.0, 1.0, 0.0, 1.0],
+            ];
+
+            // Update the projection buffer
+            self.queue.write_buffer(
+                &self.projection_buffer,
+                0,
+                bytemuck::cast_slice(&projection_matrix),
+            );
+
+            // Create bind group for UI rendering
+            let ui_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("UI Bind Group"),
+                layout: &self.ui_pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&self.font_texture_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.font_sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.projection_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            // Start render pass for UI
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Overlay Text Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load, // Don't clear, draw over existing content
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            render_pass.set_pipeline(&self.ui_pipeline);
+            render_pass.set_bind_group(0, &ui_bind_group, &[]);
+            render_pass.set_vertex_buffer(0, self.ui_vertex_buffer.slice(..));
+            render_pass.set_index_buffer(self.ui_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            render_pass.draw_indexed(0..ui_indices.len() as u32, 0, 0..1);
+        }
+
+        Ok(())
+    }
+
+    /// Add text characters to the UI rendering buffers
+    fn add_text_to_buffers(&self, ui_vertices: &mut Vec<Vertex>, ui_indices: &mut Vec<u16>, x: f32, y: f32, text: &str, font_size: f32, color: [f32; 4]) {
+        let mut current_x = x;
+        
+        for character in text.chars() {
+            if let Some((uv_coords, advance_width, height)) = self.char_data.get(&character) {
+                let scale_factor = font_size / 32.0; // Atlas font size is 32.0
+                let char_width = advance_width * scale_factor;
+                let char_height = height * scale_factor;
+                
+                // Create quad for this character
+                let base_index = ui_vertices.len() as u16;
+                
+                // Add vertices for character quad
+                ui_vertices.extend_from_slice(&[
+                    Vertex { position: [current_x, y], tex_coords: [uv_coords[0], uv_coords[1]], color },
+                    Vertex { position: [current_x + char_width, y], tex_coords: [uv_coords[2], uv_coords[1]], color },
+                    Vertex { position: [current_x + char_width, y + char_height], tex_coords: [uv_coords[2], uv_coords[3]], color },
+                    Vertex { position: [current_x, y + char_height], tex_coords: [uv_coords[0], uv_coords[3]], color },
+                ]);
+                
+                // Add indices for character quad (two triangles)
+                ui_indices.extend_from_slice(&[
+                    base_index, base_index + 1, base_index + 2,
+                    base_index, base_index + 2, base_index + 3,
+                ]);
+                
+                current_x += char_width;
+            } else if character == ' ' {
+                // Handle spaces
+                current_x += font_size * 0.25;
+            } else {
+                // Handle unknown characters (space them appropriately)
+                current_x += font_size * 0.5;
+            }
+        }
+    }
+
     /// Get memory usage statistics
     pub fn get_memory_stats(&self) -> (usize, usize, usize, usize) {
         (
